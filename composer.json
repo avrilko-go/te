@@ -1,0 +1,27 @@
+{
+  "name": "avrilko/te",
+  "description": "php event loop framwork",
+  "type": "library",
+  "license": "MIT",
+  "autoload": {
+    "psr-4": {
+      "Te\\": "src/"
+    }
+  },
+  "authors": [
+    {
+      "name": "avrilko",
+      "email": "475721797@qq.com"
+    }
+  ],
+  "require": {
+    "php": "^8.0",
+    "ext-pcntl": "*",
+    "ext-posix": "*",
+    "ext-sockets": "*",
+    "opis/closure": "^3.6"
+  },
+  "require-dev": {
+    "paulxu-cn/event-ide-helper": "^0.1.0"
+  }
+}

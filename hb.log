@@ -1,0 +1,839 @@
+21    epoll_pwait(4, [{EPOLLIN, {u32=3, u64=3}}], 32, -1, NULL, 8) = 1
+21    ppoll([{fd=3, events=POLLIN|POLLERR|POLLHUP}], 1, {tv_sec=0, tv_nsec=0}, NULL, 0) = 1 ([{fd=3, revents=POLLIN}], left {tv_sec=0, tv_nsec=0})
+21    accept(3, {sa_family=AF_INET, sin_port=htons(64758), sin_addr=inet_addr("172.28.0.1")}, [128->16]) = 7
+21    setsockopt(7, SOL_TCP, TCP_NODELAY, [1], 4) = 0
+21    faccessat(AT_FDCWD, "/web/te/vendor/composer/../../src/TcpConnection.php", F_OK) = 0
+21    newfstatat(AT_FDCWD, "/web/te/vendor/composer/../../src/TcpConnection.php", {st_mode=S_IFREG|0644, st_size=6942, ...}, AT_SYMLINK_NOFOLLOW) = 0
+21    openat(AT_FDCWD, "/web/te/src/TcpConnection.php", O_RDONLY) = 8
+21    fstat(8, {st_mode=S_IFREG|0644, st_size=6942, ...}) = 0
+21    read(8, "<?php\n\nnamespace Te;\n\nuse Te\\Event\\Event;\n\nclass TcpConnection\n{\n    public $socketFd;\n\n    public string $clientIp;\n\n    public Server $server;\n\n    public int $readBuffSize = 1024;\n\n    /**\n     * @var int \345\275\223\345\211\215\347\274\223\345\206\262\345\214\272\345\244\247\345\260\217\n     */\n    public int $receiveBufferSize = 1024 * 100;\n\n    /**\n     * @var int \345\275\223\345\211\215\350\277\236\346\216\245\345\267\262\347\273\217\350\257\273\345\217\226\347\232\204\351\225\277\345\272\246\n     */\n    public int $receiveLen = 0;\n\n    /**\n     * @var int \350\241\250\347\244\272\345\275\223\345\211\215\350\277\236\346\216\245\350\266\205\345\207\272\347\274\223\345\206\262\345\214\272\345\244\247\345\260\217\347\232\204\346\254\241\346\225\260\n     */\n    public int $receiveBufferFullTimes = 0;\n    /**\n     * @var string \347\274\223\345\206\262\345\214\272\n     */\n    public string $receiveBuff = '';\n\n\n    public int $sendLen = 0;\n\n    public string $sendBuffer = '';\n\n    public int $sendBuffSize = 1024 * 1000;\n\n    public int $sendBuffFullTimes = 0;\n\n    public int $heartTime = 0;\n\n    public const HEART_TIME = 20;\n\n    public const STATUS_CONNECTED = 10;\n\n    public const STATUS_CLOSED = 11;\n\n    public int $status;\n\n    public function __construct($socketFd, string $clientIp, Server $server)\n    {\n        $this->socketFd = $socketFd;\n        $this->clientIp = $clientIp;\n        $this->server = $server;\n        $this->resetHeartTime();\n        $this->status = self::STATUS_CONNECTED;\n        stream_set_blocking($this->socketFd, 0);\n        stream_set_read_buffer($this->socketFd, 0);\n        stream_set_write_buffer($this->socketFd, 0);\n        $server::$eventLoop->add($this->socketFd, Event::EV_READ, [$this, 'readSocket']);\n    }\n\n    public function isConnected(): bool\n    {\n        return $this->status === self::STATUS_CONNECTED && is_resource($this->socketFd);\n    }\n\n    public function resetHeartTime()\n    {\n        $this->heartTime = time();\n    }\n\n    public function checkHeartTime(): bool\n    {\n        $now = time();\n        if ($now - $this->heartTime >= self::HEART_TIME) {\n            $this->server->echoLog(\"\345\277\203\350\267\263\346\227\266\351\227\264\345\267\262\347\273\217\350\266\205\345\207\272:%d\", $now - $this->heartTime);\n            return true;\n        } else {\n            return false;\n        }\n    }\n\n    public function getSocketFd()\n    {\n        return $this->socketFd;\n    }\n\n    public function readSocket()\n    {\n        if ($this->receiveLen < $this->receiveBufferSize) {\n            $data = fread($this->socketFd, $this->readBuffSize);\n            if ($data === '' || $data === false) {\n                if (feof($this->socketFd) || !is_resource($this->socketFd)) {\n                    $this->close();\n                    return;\n                }\n            } else {\n                $this->receiveBuff .= $data;\n                $this->receiveLen += strlen($data);\n                $this->server->onReceive();\n            }\n        } else {\n            $this->receiveBufferFullTimes++;\n        }\n\n        if ($this->receiveLen > 0 && !empty($data)) {\n            $this->handleMessage();\n        }\n    }\n\n    public function handleMessage()\n    {\n        if ($this->server->protocol !== null && is_object($this->server->protocol)) {\n            while ($this->server->protocol->len($this->receiveBuff)) {\n                $msgLen = $this->server->protocol->msgLen($this->receiveBuff);\n                $oneMsg = substr($this->receiveBuff, 0, $msgLen);\n                $this->receiveBuff = substr($this->receiveBuff, $msgLen);\n                $this->receiveLen -= $msgLen;\n                $this->receiveBufferFullTimes--;\n                $this->server->onMessage();\n                $this->resetHeartTime();\n                $message = $this->server->protocol->decode($oneMsg);\n                $this->server->runEventCallback('receive', [$message, $this]);\n            }\n        } else {\n            $this->server->runEventCallback('receive', [$this->receiveBuff, $this]);\n            $this->receiveBuff = \"\";\n            $this->receiveLen = 0;\n            $this->server->onMessage();\n            $this->resetHeartTime();\n            $this->receiveBufferFullTimes = 0;\n        }\n    }\n\n    public function writeSocket()\n    {\n        if ($this->needWrite()) {\n            if (is_resource($this->socketFd)) {\n                set_error_handler(\n                    function () {\n                    }\n                );\n                $writeLen = fwrite($this->socketFd, $this->sendBuffer, $this->sendLen);\n                restore_error_handler();\n                if ($writeLen === $this->sendLen) {\n                    $this->sendLen = 0;\n                    $this->sendBuffer = '';\n                    Server::$eventLoop->del($this->socketFd, Event::EV_WRITE);\n                    return true;\n                } elseif ($writeLen > 0) {\n                    $this->sendBuffer = substr($this->sendBuffer, $writeLen);\n                    $this->sendLen -= $writeLen;\n                } else {\n                    $this->close();\n                }\n            }\n        }\n    }\n\n    public function needWrite(): bool\n    {\n        return $this->sendLen > 0;\n    }\n\n    public function send(string $data): void\n    {\n        $len = strlen($data);\n        if ($this->sendLen + $len < $this->sendBuffSize) {\n            if ($this->server->protocol !== null && is_object($this->server->protocol)) {\n                [$encodeLen, $data] = $this->server->protocol->encode($data);\n                $this->sendBuffer .= $data;\n                $this->sendLen += $encodeLen;\n            } else {\n                $this->sendBuffer .= $data;\n                $this->sendLen += $len;\n            }\n\n            if ($this->sendLen >= $this->sendBuffSize) {\n                $this->sendBuffFullTimes++;\n            }\n        }\n        Server::$eventLoop->add($this->socketFd, Event::EV_WRITE, [$this, 'writeSocket']);\n\n//        if (is_resource($this->socketFd)) {\n//            $writeLen = fwrite($this->socketFd, $this->sendBuffer, $this->sendLen);\n//            if ($writeLen === $this->sendLen) {\n//                $this->sendBuffer = \"\";\n//                $this->sendLen = 0;\n//                $this->sendBuffFullTimes = 0;\n//                return;\n//            } elseif ($writeLen > 0) {\n//                $this->sendBuffer = substr($this->sendBuffer, $writeLen);\n//                $this->sendLen -= $writeLen;\n//                $this->sendBuffFullTimes--;\n//            } else {\n//                $this->close();\n//            }\n//        }\n    }\n\n    public function close()\n    {\n        Server::$eventLoop->del($this->socketFd, Event::EV_READ);\n        Server::$eventLoop->del($this->socketFd, Event::EV_WRITE);\n\n        if (is_resource($this->socketFd)) {\n            fclose($this->socketFd);\n        }\n        $this->server->runEventCallback('close', [$this]);\n        $this->server->removeClient($this->socketFd);\n        $this->status = self::STATUS_CLOSED;\n        $this->socketFd = null;\n        $this->sendLen = 0;\n        $this->sendBuffer = '';\n        $this->sendBuffFullTimes = 0;\n        $this->sendBuffSize = 0;\n\n        $this->receiveLen = 0;\n        $this->receiveBuff = '';\n        $this->receiveBufferFullTimes = 0;\n        $this->receiveBufferSize = 0;\n    }\n}\n", 6942) = 6942
+21    close(8)                          = 0
+21    fcntl(7, F_GETFL)                 = 0x2 (flags O_RDWR)
+21    fcntl(7, F_SETFL, O_RDWR|O_NONBLOCK) = 0
+21    epoll_ctl(4, EPOLL_CTL_ADD, 7, {EPOLLIN, {u32=7, u64=7}}) = 0
+21    getpid()                          = 21
+21    write(1, "\346\234\211\345\256\242\346\210\267\347\253\257\350\277\236\346\216\245\344\272\206 pid = 21 172.28.0.1:64758", 47) = 47
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    recvfrom(7, "GET / HTTP/1.1\r\nHost: 127.0.0.1:2345\r\nUser-Agent: curl/7.64.1\r\nAccept: */*\r\n\r\n", 1024, 0, NULL, NULL) = 78
+21    mmap(NULL, 65536, PROT_READ|PROT_WRITE|PROT_EXEC, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0) = 0xffffaa878000
+21    mprotect(0xffffaa878000, 65536, PROT_READ|PROT_WRITE|PROT_EXEC) = 0
+21    write(1, "receive from client\357\274\23220 data:GET / HTTP/1.1\r\nHost: 127.0.0.1:2345\r\nUser-Agent: curl/7.64.1\r\nAccept: */*", 104) = 104
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46) = 46
+21    write(2, "PHP   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n", 60) = 60
+21    write(2, "PHP   4. Te\\Server->worker() /web/te/src/Server.php:179\n", 56) = 56
+21    write(2, "PHP   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n", 59) = 59
+21    write(2, "PHP   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n", 59) = 59
+21    write(2, "PHP   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n", 63) = 63
+21    write(1, "\nWarning: EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n\nCall Stack:\n    0.0006     400176   1. {main}() /web/te/te.php:0\n    0.0150     575592   2. Te\\Server->start() /web/te/te.php:89\n    0.0214     588088   3. Te\\Server->forkWorker() /web/te/src/Server.php:412\n    0.0220     588088   4. Te\\Server->worker() /web/te/src/Server.php:179\n    0.0259     612872   5. Te\\Server->eventLoop() /web/te/src/Server.php:283\n    0.0259     612872   6. Te\\Event\\Epoll->loop() /web/te/src/Server.php:130\n    0.0259     612872   7. EventBase->dispatch() /web/te/src/Event/Epoll.php:128\n\n", 626) = 626
+21    epoll_pwait(4, [{EPOLLIN, {u32=7, u64=7}}], 32, -1, NULL, 8) = 1
+21    write(2, "PHP Warning:  EventBase::dispatch(): Failed to invoke event callback in /web/te/src/Event/Epoll.php on line 128\n", 112) = 112
+21    write(2, "PHP Stack trace:\n", 17) = 17
+21    write(2, "PHP   1. {main}() /web/te/te.php:0\n", 35) = 35
+21    write(2, "PHP   2. Te\\Server->start() /web/te/te.php:89\n", 46
